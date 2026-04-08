@@ -210,6 +210,11 @@ RUN mkdir -p \
 # image updates without touching the application code.
 COPY --from=source --chown=www-data:root /var/www/html /var/www/html
 
+# Reference copy of default config files, outside the volume.
+# Used by the entrypoint to warn if the persistent config volume contains
+# stale files that differ from the current image defaults.
+COPY --from=source /var/www/html/config /usr/src/nextcloud-config
+
 RUN chmod -R g=u /var/www/html
 
 # Persistent data: only what the user actually modifies at runtime.

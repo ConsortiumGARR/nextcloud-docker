@@ -1,15 +1,12 @@
 #!/bin/sh
-# shellcheck shell=sh
 set -eu
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
+# version_greater A B returns whether A > B
 version_greater() {
     [ "$(printf '%s\n' "$@" | sort -t '.' -n -k1,1 -k2,2 -k3,3 -k4,4 | head -n 1)" != "$1" ]
 }
 
+# return true if specified directory is empty
 directory_empty() {
     [ -z "$(ls -A "$1/")" ]
 }
@@ -22,15 +19,53 @@ run_as() {
     fi
 }
 
-# Support VAR and VAR_FILE (Docker secrets)
+# Execute all executable files in a given directory in alphanumeric order
+run_path() {
+    local hook_folder_path="/docker-entrypoint-hooks.d/$1"
+    local found=0
+
+    echo "=> Searching for hook scripts (*.sh) to run, located in the folder \"${hook_folder_path}\""
+
+    if ! [ -d "${hook_folder_path}" ] || directory_empty "${hook_folder_path}"; then
+        echo "==> Skipped: the \"$1\" folder is empty (or does not exist)"
+        return 0
+    fi
+
+    find "${hook_folder_path}" -maxdepth 1 -iname '*.sh' '(' -type f -o -type l ')' -print | sort | (
+        while read -r script_file_path; do
+            if ! [ -x "${script_file_path}" ]; then
+                echo "==> The script \"${script_file_path}\" was skipped, because it lacks the executable flag"
+                continue
+            fi
+
+            echo "==> Running the script (cwd: $(pwd)): \"${script_file_path}\""
+            found=$((found+1))
+            run_as "${script_file_path}" || {
+                return_code="$?"
+                echo "==> Failed at executing script \"${script_file_path}\". Exit code: ${return_code}"
+                exit 1
+            }
+
+            echo "==> Finished executing the script: \"${script_file_path}\""
+        done
+        if [ "$found" -gt "0" ]; then
+		    echo "=> Completed executing scripts in the \"$1\" folder"
+        else
+		    echo "==> Skipped: the \"$1\" folder does not contain any valid scripts"
+        fi
+    )
+}
+
+# usage: file_env VAR [DEFAULT]
+#    ie: file_env 'XYZ_DB_PASSWORD' 'example'
+# (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
+#  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
 file_env() {
     local var="$1"
     local fileVar="${var}_FILE"
     local def="${2:-}"
-    local varValue
-    local fileVarValue
-    varValue=$(env | grep -E "^${var}=" | sed -E "s/^${var}=//" || true)
-    fileVarValue=$(env | grep -E "^${fileVar}=" | sed -E "s/^${fileVar}=//" || true)
+    local varValue=$(env | grep -E "^${var}=" | sed -E -e "s/^${var}=//")
+    local fileVarValue=$(env | grep -E "^${fileVar}=" | sed -E -e "s/^${fileVar}=//")
     if [ -n "${varValue}" ] && [ -n "${fileVarValue}" ]; then
         echo >&2 "error: both $var and $fileVar are set (but are exclusive)"
         exit 1
@@ -40,50 +75,32 @@ file_env() {
     elif [ -n "${fileVarValue}" ]; then
         export "$var"="$(cat "${fileVarValue}")"
     elif [ -n "${def}" ]; then
-        export "$var"="${def}"
+        export "$var"="$def"
     fi
     unset "$fileVar"
 }
 
-# Run all executable *.sh scripts in /docker-entrypoint-hooks.d/<hook>
-run_path() {
-    local hook_folder_path="/docker-entrypoint-hooks.d/$1"
-
-    echo "=> Searching for hook scripts in \"${hook_folder_path}\""
-
-    if ! [ -d "${hook_folder_path}" ] || directory_empty "${hook_folder_path}"; then
-        echo "==> Skipped: \"$1\" folder is empty or does not exist"
-        return 0
-    fi
-
-    find "${hook_folder_path}" -maxdepth 1 -iname '*.sh' '(' -type f -o -type l ')' -print | sort | \
-    while read -r script_file_path; do
-        if ! [ -x "${script_file_path}" ]; then
-            echo "==> Skipped (no +x): \"${script_file_path}\""
-            continue
-        fi
-        echo "==> Running: \"${script_file_path}\""
-        run_as "${script_file_path}" || {
-            echo "==> Failed: \"${script_file_path}\" (exit $?)"
-            exit 1
-        }
-        echo "==> Done: \"${script_file_path}\""
-    done
+get_enabled_apps() {
+    run_as 'php /var/www/html/occ app:list' \
+        | sed -n '/^Enabled:$/,/^Disabled:$/p' \
+        | sed '1d;$d' \
+        | sed -n 's/^  - \([^:]*\):.*/\1/p' \
+        | sort
 }
 
-# Write /usr/local/etc/php/conf.d/redis-session.ini if REDIS_HOST is set
+# Write PHP session config for Redis to /usr/local/etc/php/conf.d/redis-session.ini
 configure_redis_session() {
+    local redis_save_path
+    local redis_auth=''
+
     echo "=> Configuring PHP session handler..."
 
     if [ -z "${REDIS_HOST:-}" ]; then
-        echo "==> REDIS_HOST not set, using default PHP session handler"
+        echo "==> Using default PHP session handler"
         return 0
     fi
 
     file_env REDIS_HOST_PASSWORD
-
-    local redis_save_path redis_auth
-    redis_auth=''
 
     case "$REDIS_HOST" in
         /*)
@@ -100,27 +117,21 @@ configure_redis_session() {
         redis_auth="?auth=${REDIS_HOST_PASSWORD}"
     fi
 
-    echo "==> Using Redis as PHP session handler (${redis_save_path})"
+    echo "==> Using Redis as PHP session handler..."
     {
         echo 'session.save_handler = redis'
         echo "session.save_path = \"${redis_save_path}${redis_auth}\""
-        echo 'redis.session.locking_enabled = 1'
-        echo 'redis.session.lock_retries = -1'
-        echo 'redis.session.lock_wait_time = 10000'
+        echo "redis.session.locking_enabled = 1"
+        echo "redis.session.lock_retries = -1"
+        # redis.session.lock_wait_time is specified in microseconds.
+        # Wait 10ms before retrying the lock rather than the default 2ms.
+        echo "redis.session.lock_wait_time = 10000"
     } > /usr/local/etc/php/conf.d/redis-session.ini
 }
 
-get_enabled_apps() {
-    run_as 'php /var/www/html/occ app:list' \
-        | sed -n '/^Enabled:$/,/^Disabled:$/p' \
-        | sed '1d;$d' \
-        | sed -n 's/^  - \([^:]*\):.*/\1/p' \
-        | sort
-}
-
-# ---------------------------------------------------------------------------
+########################################################################
 # Main
-# ---------------------------------------------------------------------------
+########################################################################
 
 if expr "$1" : "apache" 1>/dev/null; then
     if [ -n "${APACHE_DISABLE_REWRITE_IP+x}" ]; then
@@ -129,188 +140,202 @@ if expr "$1" : "apache" 1>/dev/null; then
 fi
 
 if expr "$1" : "apache" 1>/dev/null || [ "$1" = "php-fpm" ] || [ "${NEXTCLOUD_UPDATE:-0}" -eq 1 ]; then
-
-    # Resolve user/group that Apache or php-fpm will run as
-    if [ "$(id -u)" = 0 ]; then
+    uid="$(id -u)"
+    gid="$(id -g)"
+    if [ "$uid" = '0' ]; then
         case "$1" in
             apache2*)
                 user="${APACHE_RUN_USER:-www-data}"
                 group="${APACHE_RUN_GROUP:-www-data}"
+
+                # strip off any '#' symbol ('#1000' is valid syntax for Apache)
                 user="${user#'#'}"
                 group="${group#'#'}"
                 ;;
-            *)
+            *) # php-fpm
                 user='www-data'
                 group='www-data'
                 ;;
         esac
     else
-        user="$(id -u)"
-        group="$(id -g)"
+        user="$uid"
+        group="$gid"
     fi
 
     configure_redis_session
 
-    # Serialize across replicas starting simultaneously (e.g. rolling restart)
+    # If another process is syncing the html folder, wait for
+    # it to be done, then escape initalization.
     (
         if ! flock -n 9; then
-            echo "Another instance is initializing Nextcloud. Waiting..."
+            # If we couldn't get it immediately, show a message, then wait for real
+            echo "Another process is initializing Nextcloud. Waiting..."
             flock 9
         fi
 
-        # The image version is always what is on disk — the code is baked in.
+        # The code is baked into the image: image_version is always current.
+        # shellcheck disable=SC2016
         image_version="$(php -r 'require "/var/www/html/version.php"; echo implode(".", $OC_Version);')"
 
-        # The installed version is what the database knows about.
-        # config/config.php is on a persistent volume; absence means fresh install.
+        # The installed version is tracked in config/version.php (persistent volume).
+        # This file is written by the entrypoint after each successful install/upgrade.
+        # Absence means a fresh installation.
         installed_version="0.0.0.0"
-        if [ -f /var/www/html/config/config.php ]; then
-            # occ status is more reliable than parsing config.php directly
-            installed_version="$(php -r '
-                require "/var/www/html/version.php";
-                $cfg = "/var/www/html/config/config.php";
-                if (!file_exists($cfg)) exit;
-                $CONFIG = [];
-                include $cfg;
-                echo $CONFIG["version"] ?? "0.0.0.0";
-            ')"
+        if [ -f /var/www/html/config/version.php ]; then
+            # shellcheck disable=SC2016
+            installed_version="$(php -r 'require "/var/www/html/config/version.php"; echo implode(".", $OC_Version);')"
         fi
 
-        echo "=> Image version:     ${image_version}"
-        echo "=> Installed version: ${installed_version}"
-
-        # Safety: refuse to downgrade
         if version_greater "$installed_version" "$image_version"; then
-            echo "ERROR: installed version (${installed_version}) is newer than the image (${image_version})."
-            echo "Downgrading is not supported. Pull the correct image version."
+            echo "Can't start Nextcloud because the version of the data ($installed_version) is higher than the docker image version ($image_version) and downgrading is not supported. Are you sure you have pulled the newest image version?"
             exit 1
         fi
 
-        # Safety: refuse to skip major versions
-        if [ "$installed_version" != "0.0.0.0" ]; then
-            image_major="${image_version%%.*}"
-            installed_major="${installed_version%%.*}"
-            if [ "$((image_major - installed_major))" -gt 1 ]; then
-                echo "ERROR: cannot upgrade from ${installed_version} to ${image_version} directly."
-                echo "Upgrade one major version at a time."
-                exit 1
+        if version_greater "$image_version" "$installed_version"; then
+            echo "Initializing nextcloud $image_version ..."
+            if [ "$installed_version" != "0.0.0.0" ]; then
+                if [ "${image_version%%.*}" -gt "$((${installed_version%%.*} + 1))" ]; then
+                    echo "Can't start Nextcloud because upgrading from $installed_version to $image_version is not supported."
+                    echo "It is only possible to upgrade one major version at a time. For example, if you want to upgrade from version 14 to 16, you will have to upgrade from version 14 to 15, then from 15 to 16."
+                    exit 1
+                fi
+                echo "Upgrading nextcloud from $installed_version ..."
+                get_enabled_apps > /tmp/list_before
             fi
-        fi
 
-        # ------------------------------------------------------------------
-        # Fresh installation
-        # ------------------------------------------------------------------
-        if [ "$installed_version" = "0.0.0.0" ]; then
-            echo "=> New Nextcloud instance — running installation..."
+            # Install
+            if [ "$installed_version" = "0.0.0.0" ]; then
+                echo "New nextcloud instance"
 
-            file_env NEXTCLOUD_ADMIN_PASSWORD
-            file_env NEXTCLOUD_ADMIN_USER
+                file_env NEXTCLOUD_ADMIN_PASSWORD
+                file_env NEXTCLOUD_ADMIN_USER
 
-            install=false
-
-            if [ -n "${NEXTCLOUD_ADMIN_USER+x}" ] && [ -n "${NEXTCLOUD_ADMIN_PASSWORD+x}" ]; then
-                # shellcheck disable=SC2016
-                install_options='-n --admin-user "$NEXTCLOUD_ADMIN_USER" --admin-pass "$NEXTCLOUD_ADMIN_PASSWORD"'
-
-                if [ -n "${NEXTCLOUD_DATA_DIR+x}" ]; then
+                install=false
+                if [ -n "${NEXTCLOUD_ADMIN_USER+x}" ] && [ -n "${NEXTCLOUD_ADMIN_PASSWORD+x}" ]; then
                     # shellcheck disable=SC2016
-                    install_options="${install_options} --data-dir \"\$NEXTCLOUD_DATA_DIR\""
-                fi
-
-                file_env MYSQL_DATABASE
-                file_env MYSQL_PASSWORD
-                file_env MYSQL_USER
-                file_env POSTGRES_DB
-                file_env POSTGRES_PASSWORD
-                file_env POSTGRES_USER
-
-                if [ -n "${SQLITE_DATABASE+x}" ]; then
-                    echo "==> Database: SQLite"
-                    # shellcheck disable=SC2016
-                    install_options="${install_options} --database-name \"\$SQLITE_DATABASE\""
-                    install=true
-                elif [ -n "${MYSQL_DATABASE+x}" ] && [ -n "${MYSQL_USER+x}" ] && \
-                     [ -n "${MYSQL_PASSWORD+x}" ] && [ -n "${MYSQL_HOST+x}" ]; then
-                    echo "==> Database: MySQL/MariaDB"
-                    # shellcheck disable=SC2016
-                    install_options="${install_options} --database mysql --database-name \"\$MYSQL_DATABASE\" --database-user \"\$MYSQL_USER\" --database-pass \"\$MYSQL_PASSWORD\" --database-host \"\$MYSQL_HOST\""
-                    install=true
-                elif [ -n "${POSTGRES_DB+x}" ] && [ -n "${POSTGRES_USER+x}" ] && \
-                     [ -n "${POSTGRES_PASSWORD+x}" ] && [ -n "${POSTGRES_HOST+x}" ]; then
-                    echo "==> Database: PostgreSQL"
-                    # shellcheck disable=SC2016
-                    install_options="${install_options} --database pgsql --database-name \"\$POSTGRES_DB\" --database-user \"\$POSTGRES_USER\" --database-pass \"\$POSTGRES_PASSWORD\" --database-host \"\$POSTGRES_HOST\""
-                    install=true
-                fi
-
-                if [ "$install" = true ]; then
-                    run_path pre-installation
-
-                    max_retries=10
-                    try=0
-                    until [ "$try" -gt "$max_retries" ] || \
-                          run_as "php /var/www/html/occ maintenance:install ${install_options}"; do
-                        echo "==> Installation attempt $((try+1))/${max_retries} failed, retrying in 10s..."
-                        try=$((try+1))
-                        sleep 10
-                    done
-
-                    if [ "$try" -gt "$max_retries" ]; then
-                        echo "ERROR: Nextcloud installation failed after ${max_retries} attempts."
-                        exit 1
+                    install_options='-n --admin-user "$NEXTCLOUD_ADMIN_USER" --admin-pass "$NEXTCLOUD_ADMIN_PASSWORD"'
+                    if [ -n "${NEXTCLOUD_DATA_DIR+x}" ]; then
+                        # shellcheck disable=SC2016
+                        install_options=$install_options' --data-dir "$NEXTCLOUD_DATA_DIR"'
                     fi
 
-                    if [ -n "${NEXTCLOUD_TRUSTED_DOMAINS+x}" ]; then
-                        echo "==> Setting trusted domains..."
-                        set -f
-                        idx=1
-                        for domain in ${NEXTCLOUD_TRUSTED_DOMAINS}; do
-                            domain="$(echo "${domain}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-                            run_as "php /var/www/html/occ config:system:set trusted_domains ${idx} --value=\"${domain}\""
-                            idx=$((idx+1))
+                    file_env MYSQL_DATABASE
+                    file_env MYSQL_PASSWORD
+                    file_env MYSQL_USER
+                    file_env POSTGRES_DB
+                    file_env POSTGRES_PASSWORD
+                    file_env POSTGRES_USER
+
+                    if [ -n "${SQLITE_DATABASE+x}" ]; then
+                        echo "Installing with SQLite database"
+                        # shellcheck disable=SC2016
+                        install_options=$install_options' --database-name "$SQLITE_DATABASE"'
+                        install=true
+                    elif [ -n "${MYSQL_DATABASE+x}" ] && [ -n "${MYSQL_USER+x}" ] && [ -n "${MYSQL_PASSWORD+x}" ] && [ -n "${MYSQL_HOST+x}" ]; then
+                        echo "Installing with MySQL database"
+                        # shellcheck disable=SC2016
+                        install_options=$install_options' --database mysql --database-name "$MYSQL_DATABASE" --database-user "$MYSQL_USER" --database-pass "$MYSQL_PASSWORD" --database-host "$MYSQL_HOST"'
+                        install=true
+                    elif [ -n "${POSTGRES_DB+x}" ] && [ -n "${POSTGRES_USER+x}" ] && [ -n "${POSTGRES_PASSWORD+x}" ] && [ -n "${POSTGRES_HOST+x}" ]; then
+                        echo "Installing with PostgreSQL database"
+                        # shellcheck disable=SC2016
+                        install_options=$install_options' --database pgsql --database-name "$POSTGRES_DB" --database-user "$POSTGRES_USER" --database-pass "$POSTGRES_PASSWORD" --database-host "$POSTGRES_HOST"'
+                        install=true
+                    fi
+
+                    if [ "$install" = true ]; then
+                        run_path pre-installation
+
+                        echo "Starting nextcloud installation"
+                        max_retries=10
+                        try=0
+                        until  [ "$try" -gt "$max_retries" ] || run_as "php /var/www/html/occ maintenance:install $install_options"
+                        do
+                            echo "Retrying install..."
+                            try=$((try+1))
+                            sleep 10s
                         done
-                        set +f
-                    fi
+                        if [ "$try" -gt "$max_retries" ]; then
+                            echo "Installing of nextcloud failed!"
+                            exit 1
+                        fi
+                        if [ -n "${NEXTCLOUD_TRUSTED_DOMAINS+x}" ]; then
+                            echo "Setting trusted domains…"
+			    set -f # turn off glob
+                            NC_TRUSTED_DOMAIN_IDX=1
+                            for DOMAIN in ${NEXTCLOUD_TRUSTED_DOMAINS}; do
+                                DOMAIN=$(echo "${DOMAIN}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                                run_as "php /var/www/html/occ config:system:set trusted_domains $NC_TRUSTED_DOMAIN_IDX --value=\"${DOMAIN}\""
+                                NC_TRUSTED_DOMAIN_IDX=$((NC_TRUSTED_DOMAIN_IDX+1))
+                            done
+			    set +f # turn glob back on
+                        fi
 
-                    run_path post-installation
+                        cp /var/www/html/version.php /var/www/html/config/version.php
+                        run_path post-installation
+		    fi
                 fi
+		# not enough specified to do a fully automated installation
+                if [ "$install" = false ]; then
+                    echo "Next step: Access your instance to finish the web-based installation!"
+                    echo "Hint: You can specify NEXTCLOUD_ADMIN_USER and NEXTCLOUD_ADMIN_PASSWORD and the database variables _prior to first launch_ to fully automate initial installation."
+                fi
+            # Upgrade
+            else
+                run_path pre-upgrade
+
+                run_as 'php /var/www/html/occ upgrade'
+
+                get_enabled_apps > /tmp/list_after
+                disabled_apps="$(comm -23 /tmp/list_before /tmp/list_after || true)"
+                if [ -n "$disabled_apps" ]; then
+                    echo "The following apps have been disabled:"
+                    printf '%s\n' "$disabled_apps"
+                fi
+                rm -f /tmp/list_before /tmp/list_after
+
+                # Database optimization post-upgrade
+                if [ "${NEXTCLOUD_SKIP_DATABASE_OPTIMIZATION:-no}" != yes ]; then
+                    echo "Performing database optimizations..."
+                    run_as 'php /var/www/html/occ maintenance:repair --include-expensive'
+                    run_as 'php /var/www/html/occ db:add-missing-indices'
+                    run_as 'php /var/www/html/occ db:add-missing-columns'
+                    run_as 'php /var/www/html/occ db:add-missing-primary-keys'
+                    run_as 'yes | php /var/www/html/occ db:convert-filecache-bigint'
+                fi
+
+                cp /var/www/html/version.php /var/www/html/config/version.php
+                run_path post-upgrade
             fi
 
-            if [ "$install" = false ]; then
-                echo "=> Admin credentials not provided — finish installation via the web interface."
-                echo "   Set NEXTCLOUD_ADMIN_USER, NEXTCLOUD_ADMIN_PASSWORD and database variables to automate this."
-            fi
-
-        # ------------------------------------------------------------------
-        # Upgrade
-        # ------------------------------------------------------------------
-        elif version_greater "$image_version" "$installed_version"; then
-            echo "=> Upgrading Nextcloud from ${installed_version} to ${image_version}..."
-
-            get_enabled_apps > /tmp/nc_apps_before
-
-            run_path pre-upgrade
-            run_as 'php /var/www/html/occ upgrade'
-            run_path post-upgrade
-
-            get_enabled_apps > /tmp/nc_apps_after
-            disabled_apps="$(comm -23 /tmp/nc_apps_before /tmp/nc_apps_after || true)"
-            if [ -n "$disabled_apps" ]; then
-                echo "=> The following apps were disabled during upgrade:"
-                printf '%s\n' "$disabled_apps"
-            fi
-            rm -f /tmp/nc_apps_before /tmp/nc_apps_after
-
-            echo "=> Upgrade complete."
-        else
-            echo "=> Nextcloud ${installed_version} is up to date."
+            echo "Initializing finished"
         fi
 
+        # Update htaccess after init if requested
         if [ -n "${NEXTCLOUD_INIT_HTACCESS+x}" ] && [ "$installed_version" != "0.0.0.0" ]; then
             run_as 'php /var/www/html/occ maintenance:update:htaccess'
         fi
+    ) 9> /var/www/html/config/nextcloud-init-sync.lock
 
-    ) 9>/tmp/nextcloud-init.lock
+    # warn if config files on persistent storage differ from the latest version of this image
+    for cfgPath in /usr/src/nextcloud-config/*.php; do
+        cfgFile=$(basename "$cfgPath")
+
+        if [ "$cfgFile" != "config.sample.php" ] && [ "$cfgFile" != "autoconfig.php" ]; then
+            if ! cmp -s "/usr/src/nextcloud-config/$cfgFile" "/var/www/html/config/$cfgFile"; then
+                echo "Warning: /var/www/html/config/$cfgFile differs from the latest version of this image at /usr/src/nextcloud-config/$cfgFile"
+            fi
+        fi
+    done
+
+    # Enable support app and set subscription key if provided
+    if [ -n "${SUBSCRIPTION_KEY:-}" ]; then
+        run_as 'php /var/www/html/occ app:enable support'
+        if [ -z "$(run_as 'php /var/www/html/occ config:app:get support potential_subscription_key')" ]; then
+            run_as "php /var/www/html/occ config:app:set support potential_subscription_key --value=\"${SUBSCRIPTION_KEY}\""
+            run_as 'php /var/www/html/occ config:app:delete support last_check'
+        fi
+    fi
 
     run_path before-starting
 fi
