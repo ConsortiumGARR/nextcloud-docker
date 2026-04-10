@@ -33,7 +33,7 @@ RUN set -ex; \
     echo "==> Downloading Nextcloud Enterprise from ${ENTERPRISE_ARCHIVE_URL}"; \
     curl -fsSL -o /tmp/nextcloud.zip "${ENTERPRISE_ARCHIVE_URL}"; \
     unzip -q /tmp/nextcloud.zip -d /tmp/src/; \
-    mv /tmp/src/nextcloud/* /var/www/html/; \
+    cp -a /tmp/src/nextcloud/. /var/www/html/; \
     rm /tmp/nextcloud.zip; \
     else \
     echo "==> Downloading Nextcloud Community ${NEXTCLOUD_VERSION}"; \
