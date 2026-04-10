@@ -148,6 +148,10 @@ RUN set -ex; \
     | awk 'sub(":$", "", $1) { print $1 }' \
     | sort -u \
     | xargs -rt apt-mark manual; \
+    # libmagickcore-extra provides optional ImageMagick delegates (HEIC, extra codecs).
+    # ldd does not trace it because it is loaded at runtime via dlopen, so it would
+    # be removed by --auto-remove without this explicit pin.
+    apt-mark manual libmagickcore-7.q16-10-extra; \
     apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
